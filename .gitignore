@@ -1,1 +1,8 @@
 /target
+
+# VS Code client dependencies
+/vscode-client/node_modules/
+
+# Local editor/OS files
+.DS_Store
+Thumbs.db
