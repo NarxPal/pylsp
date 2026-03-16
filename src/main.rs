@@ -1,9 +1,12 @@
+use std::fmt::format;
+
 use dashmap::DashMap;
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    MarkedString, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
+    HoverContents, HoverParams, HoverProviderCapability, MarkedString, MessageType,
+    ServerCapabilities, TextDocumentItem, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{
     Client, LanguageServer,
@@ -36,7 +39,38 @@ impl LanguageServer for Backend {
         })
     }
 
+    // did_open, when user opens a file, client sends the file content to server
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.client
+            .log_message(MessageType::INFO, "did_open ran")
+            .await;
+
+        // let uri = params.text_document.uri;
+        // let content = params.text_document.text;
+
+        // destructring above commented code
+        let TextDocumentItem { uri, text, .. } = params.text_document;
+
+        self.files.insert(uri, text);
+    }
+
+    // did_close, remove file content when file is closed
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+
+        self.client
+            .log_message(MessageType::INFO, format!("closed and cleared: {}", uri))
+            .await;
+
+        self.files.remove(&uri);
+    }
+
+    // params contains the changed data sent by the editor
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.client
+            .log_message(MessageType::INFO, "did_change received")
+            .await;
+
         if let Some(change) = params.content_changes.first() {
             self.files
                 .insert(params.text_document.uri, change.text.clone());
@@ -44,8 +78,12 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.client
+            .log_message(MessageType::INFO, "hover msg received")
+            .await;
+
         let uri = params.text_document_position_params.text_document.uri;
-        if let Some(content) = self.files.get(&uri) {
+        if let Some(_content) = self.files.get(&uri) {
             return Ok(Some(Hover {
                 contents: HoverContents::Scalar(MarkedString::String(
                     "Hello from Rust!".to_string(),
