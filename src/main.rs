@@ -1,6 +1,8 @@
 use std::fmt::format;
 
 use dashmap::DashMap;
+use rustpython_ast::Suite;
+use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
@@ -16,7 +18,34 @@ use tower_lsp::{LspService, Server};
 
 struct Backend {
     client: Client, // ide/editor is the client side in the protocol
-    files: DashMap<Url, String>,
+    files: DashMap<Url, (String, Option<Suite>)>,
+}
+
+impl Backend {
+    // custom helper method to avoid repetitiveness
+    async fn update_file(&self, uri: Url, text: String) {
+        // One place for parsing logic
+        let parsed_ast = match ast::Suite::parse(&text, uri.as_str()) {
+            Ok(suite) => {
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Successfully parsed {} statements", suite.len()),
+                    )
+                    .await;
+                Some(suite)
+            }
+            Err(err) => {
+                // You can log errors here once for both open/change
+                self.client
+                    .log_message(MessageType::LOG, format!("AST Parse Error: {}", err))
+                    .await;
+                None
+            }
+        };
+
+        self.files.insert(uri, (text, parsed_ast));
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -51,7 +80,7 @@ impl LanguageServer for Backend {
         // destructring above commented code
         let TextDocumentItem { uri, text, .. } = params.text_document;
 
-        self.files.insert(uri, text);
+        self.update_file(uri, text).await;
     }
 
     // did_close, remove file content when file is closed
@@ -71,9 +100,9 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "did_change received")
             .await;
 
-        if let Some(change) = params.content_changes.first() {
-            self.files
-                .insert(params.text_document.uri, change.text.clone());
+        if let Some(change) = params.content_changes.into_iter().next() {
+            self.update_file(params.text_document.uri, change.text)
+                .await;
         }
     }
 

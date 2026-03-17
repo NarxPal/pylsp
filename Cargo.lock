@@ -696,6 +696,7 @@ name = "python-ls-rust"
 version = "0.1.0"
 dependencies = [
  "dashmap 6.1.0",
+ "rustpython-ast",
  "rustpython-parser",
  "serde",
  "serde_json",
