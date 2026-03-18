@@ -1,13 +1,11 @@
-use std::fmt::format;
-
 use dashmap::DashMap;
-use rustpython_ast::Suite;
+use rustpython_ast::{ExprName, Suite, Visitor};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, MarkedString, MessageType,
+    HoverContents, HoverParams, HoverProviderCapability, MarkedString, MessageType, Position,
     ServerCapabilities, TextDocumentItem, TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{
@@ -19,6 +17,66 @@ use tower_lsp::{LspService, Server};
 struct Backend {
     client: Client, // ide/editor is the client side in the protocol
     files: DashMap<Url, (String, Option<Suite>)>,
+}
+
+struct HoverVisitor {
+    target_offset: u32,
+    found_name: Option<String>, // node/word found in the statement(entire line)
+}
+
+fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
+    let mut current_line = 0u32;
+    let mut current_col_utf16 = 0u32;
+
+    for (byte_offset, ch) in text.char_indices() {
+        if current_line == position.line && current_col_utf16 == position.character {
+            return Some(byte_offset as u32);
+        }
+
+        if ch == '\n' {
+            if current_line == position.line {
+                break;
+            }
+
+            current_line += 1;
+            current_col_utf16 = 0;
+            continue;
+        }
+
+        if current_line == position.line {
+            current_col_utf16 += ch.len_utf16() as u32;
+
+            if current_col_utf16 == position.character {
+                return Some((byte_offset + ch.len_utf8()) as u32);
+            }
+
+            if current_col_utf16 > position.character {
+                return None;
+            }
+        }
+    }
+
+    if current_line == position.line && current_col_utf16 == position.character {
+        Some(text.len() as u32)
+    } else {
+        None
+    }
+}
+
+impl Visitor for HoverVisitor {
+    //visit_expr_name, will find the variable name
+    fn visit_expr_name(&mut self, node: ExprName) {
+        // range: stores the source code location, basically col and line no.
+        let range = node.range;
+        let start = range.start().to_u32();
+        let end = range.end().to_u32();
+
+        if self.target_offset >= start && self.target_offset < end {
+            self.found_name = Some(node.id.to_string());
+        }
+
+        self.generic_visit_expr_name(node);
+    }
 }
 
 impl Backend {
@@ -112,14 +170,48 @@ impl LanguageServer for Backend {
             .await;
 
         let uri = params.text_document_position_params.text_document.uri;
-        if let Some(_content) = self.files.get(&uri) {
-            return Ok(Some(Hover {
-                contents: HoverContents::Scalar(MarkedString::String(
-                    "Hello from Rust!".to_string(),
-                )),
-                range: None,
-            }));
+        // position, tells the line & character where hover occured
+        let position = params.text_document_position_params.position;
+
+        if let Some(entry) = self.files.get(&uri) {
+            let (text, maybe_ast) = entry.value();
+
+            // Some here, since maybe_ast is an Option enum
+            if let (Some(target_offset), Some(suite)) =
+                (lsp_position_to_offset(text, position), maybe_ast)
+            {
+                // visitor will contains
+                let mut visitor = HoverVisitor {
+                    target_offset,
+                    found_name: None,
+                };
+
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("suite len check: {}", suite.len()),
+                    )
+                    .await;
+
+                for stmt in suite {
+                    visitor.visit_stmt(stmt.clone());
+                    if visitor.found_name.is_some() {
+                        break;
+                    }
+                }
+
+                if let Some(name) = visitor.found_name {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Scalar(MarkedString::String(format!(
+                            "You are hovering over: {} ",
+                            name
+                        ))),
+                        range: None,
+                    }));
+                }
+            }
         }
+
         Ok(None)
     }
 
