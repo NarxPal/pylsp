@@ -231,12 +231,16 @@ impl LanguageServer for Backend {
 
                 if let Some(name) = &visitor.found_name {
                     if let Some(fn_info) = visitor.symbol_table.get(name) {
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!("Symbol hovered: {:#?}", fn_info),
-                            )
-                            .await;
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Scalar(MarkedString::String(format!(
+                                "{}\nkind: {:?}\nlocation: {}..{}",
+                                fn_info.name,
+                                fn_info.kind,
+                                fn_info.location.start,
+                                fn_info.location.end
+                            ))),
+                            range: None,
+                        }));
                     }
 
                     return Ok(Some(Hover {
