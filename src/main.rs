@@ -1,12 +1,16 @@
+use std::collections::HashMap;
+use std::ops::Range as StdRange;
+
 use dashmap::DashMap;
-use rustpython_ast::{ExprName, Suite, Visitor};
+use rustpython_ast::{ExprName, StmtFunctionDef, Suite, Visitor};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
     HoverContents, HoverParams, HoverProviderCapability, MarkedString, MessageType, Position,
-    ServerCapabilities, TextDocumentItem, TextDocumentSyncCapability, TextDocumentSyncKind,
+    ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
+    TextDocumentSyncKind,
 };
 use tower_lsp::{
     Client, LanguageServer,
@@ -19,7 +23,15 @@ struct Backend {
     files: DashMap<Url, (String, Option<Suite>)>,
 }
 
+#[derive(Debug)]
+struct SymbolInfo {
+    name: String,
+    kind: SymbolKind, // eg. variable, func, class
+    location: StdRange<u32>,
+}
+
 struct HoverVisitor {
+    pub symbol_table: HashMap<String, SymbolInfo>,
     target_offset: u32,
     found_name: Option<String>, // node/word found in the statement(entire line)
 }
@@ -28,7 +40,11 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     let mut current_line = 0u32;
     let mut current_col_utf16 = 0u32;
 
+    // byte offset: is the index of the character which is measured in bytes
+    // ch: actual char at that index
     for (byte_offset, ch) in text.char_indices() {
+        // position.line: is just a line no. and not UTF-16 unit count.
+        // position.char: is UTF-16 unit count. hence using .len_utf8() below
         if current_line == position.line && current_col_utf16 == position.character {
             return Some(byte_offset as u32);
         }
@@ -44,6 +60,7 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
         }
 
         if current_line == position.line {
+            // current_col_utf16 is being compared to position.char above, .len_utf16() calculate the position based upon utf16 encoding, since position.char require utf16
             current_col_utf16 += ch.len_utf16() as u32;
 
             if current_col_utf16 == position.character {
@@ -75,7 +92,23 @@ impl Visitor for HoverVisitor {
             self.found_name = Some(node.id.to_string());
         }
 
+        // will visit the name in the ast
         self.generic_visit_expr_name(node);
+    }
+
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        self.symbol_table.insert(
+            node.name.to_string(), // this is fn name and not ExprName
+            SymbolInfo {
+                name: node.name.to_string(),
+                kind: SymbolKind::FUNCTION,
+                // convert special-offset-type(which is range value in here) into u32 type
+                location: node.range.start().to_u32()..node.range.end().to_u32(),
+            },
+        );
+
+        // this default method, will walk inside the fn node, which includes it's body and related nodes
+        self.generic_visit_stmt_function_def(node);
     }
 }
 
@@ -170,37 +203,42 @@ impl LanguageServer for Backend {
             .await;
 
         let uri = params.text_document_position_params.text_document.uri;
-        // position, tells the line & character where hover occured
+        // position: tells the line & character where hover occured
         let position = params.text_document_position_params.position;
 
         if let Some(entry) = self.files.get(&uri) {
+            // text: String, maybe_ast: Option<suite> for key "uri"
             let (text, maybe_ast) = entry.value();
 
-            // Some here, since maybe_ast is an Option enum
+            // nested pattern matching
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
                 // visitor will contains
                 let mut visitor = HoverVisitor {
+                    symbol_table: HashMap::new(),
                     target_offset,
                     found_name: None,
                 };
 
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("suite len check: {}", suite.len()),
-                    )
-                    .await;
-
                 for stmt in suite {
+                    // visit_stmt take one node and start traversing/visiting it
                     visitor.visit_stmt(stmt.clone());
                     if visitor.found_name.is_some() {
-                        break;
+                        break; // exit for loop once name is found
                     }
                 }
 
-                if let Some(name) = visitor.found_name {
+                if let Some(name) = &visitor.found_name {
+                    if let Some(fn_info) = visitor.symbol_table.get(name) {
+                        self.client
+                            .log_message(
+                                MessageType::INFO,
+                                format!("Symbol hovered: {:#?}", fn_info),
+                            )
+                            .await;
+                    }
+
                     return Ok(Some(Hover {
                         contents: HoverContents::Scalar(MarkedString::String(format!(
                             "You are hovering over: {} ",
