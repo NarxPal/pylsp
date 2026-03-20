@@ -30,7 +30,8 @@ struct SymbolInfo {
     location: StdRange<u32>,
 }
 
-struct HoverVisitor {
+struct HoverVisitor<'a> {
+    text: &'a str, // lifetime annotation
     pub symbol_table: HashMap<String, SymbolInfo>,
     target_offset: u32,
     found_name: Option<String>, // node/word found in the statement(entire line)
@@ -80,7 +81,21 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     }
 }
 
-impl Visitor for HoverVisitor {
+fn function_name_range(text: &str, node: &StmtFunctionDef) -> Option<StdRange<u32>> {
+    let range = node.range;
+    let start = range.start().to_usize();
+    let end = range.end().to_usize();
+    let snippet = &text[start..end];
+
+    let name = node.name.as_str();
+    let local_start = snippet.find(name)?;
+    let abs_start = start + local_start;
+    let abs_end = abs_start + name.len();
+
+    Some(abs_start as u32..abs_end as u32)
+}
+
+impl<'a> Visitor for HoverVisitor<'a> {
     //visit_expr_name, will find the variable name
     fn visit_expr_name(&mut self, node: ExprName) {
         // range: stores the source code location, basically col and line no.
@@ -97,15 +112,17 @@ impl Visitor for HoverVisitor {
     }
 
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        self.symbol_table.insert(
-            node.name.to_string(), // this is fn name and not ExprName
-            SymbolInfo {
-                name: node.name.to_string(),
-                kind: SymbolKind::FUNCTION,
-                // convert special-offset-type(which is range value in here) into u32 type
-                location: node.range.start().to_u32()..node.range.end().to_u32(),
-            },
-        );
+        if let Some(fn_name_range) = function_name_range(self.text, &node) {
+            self.symbol_table.insert(
+                node.name.to_string(), // this is fn name and not ExprName
+                SymbolInfo {
+                    name: node.name.to_string(),
+                    kind: SymbolKind::FUNCTION,
+                    // convert special-offset-type(which is range value in here) into u32 type
+                    location: fn_name_range,
+                },
+            );
+        }
 
         // this default method, will walk inside the fn node, which includes it's body and related nodes
         self.generic_visit_stmt_function_def(node);
@@ -216,6 +233,7 @@ impl LanguageServer for Backend {
             {
                 // visitor will contains
                 let mut visitor = HoverVisitor {
+                    text: text,
                     symbol_table: HashMap::new(),
                     target_offset,
                     found_name: None,
