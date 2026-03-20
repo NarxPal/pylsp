@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::Range as StdRange;
 
 use dashmap::DashMap;
-use rustpython_ast::{ExprName, StmtFunctionDef, Suite, Visitor};
+use rustpython_ast::{Expr, ExprName, StmtFunctionDef, Suite, Visitor};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
@@ -28,6 +28,7 @@ struct SymbolInfo {
     name: String,
     kind: SymbolKind, // eg. variable, func, class
     location: StdRange<u32>,
+    detail: Option<String>, // using "Option" since not every symbol will have detail
 }
 
 struct HoverVisitor<'a> {
@@ -95,6 +96,57 @@ fn function_name_range(text: &str, node: &StmtFunctionDef) -> Option<StdRange<u3
     Some(abs_start as u32..abs_end as u32)
 }
 
+fn function_signature(node: &StmtFunctionDef) -> String {
+    /*
+        since there's no single "node.params" string which could get us the params, so we have to get params by building them using the argument nodes
+    */
+
+    let params = node
+        .args
+        .args
+        .iter()
+        .map(|arg| match &arg.def.annotation {
+            // if args have type
+            Some(annotation) => format!("{}: {}", arg.def.arg, render_expr(annotation.as_ref())),
+            // if args have no type
+            None => arg.def.arg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match &node.returns {
+        // if fn have return type
+        Some(returns) => format!(
+            "{}({}) -> {}",
+            node.name,
+            params,
+            render_expr(returns.as_ref())
+        ),
+        // else no return type
+        None => format!("{}({})", node.name, params),
+    }
+}
+
+// Expr: refers to expression which is the return type of a fn
+fn render_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Name(node) => node.id.to_string(),
+        Expr::Attribute(node) => format!("{}.{}", render_expr(node.value.as_ref()), node.attr),
+        Expr::Subscript(node) => format!(
+            "{}[{}]",
+            render_expr(node.value.as_ref()),
+            render_expr(node.slice.as_ref())
+        ),
+        Expr::Tuple(node) => node
+            .elts
+            .iter()
+            .map(render_expr)
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => expr.python_name().to_string(),
+    }
+}
+
 impl<'a> Visitor for HoverVisitor<'a> {
     //visit_expr_name, will find the variable name
     fn visit_expr_name(&mut self, node: ExprName) {
@@ -120,6 +172,7 @@ impl<'a> Visitor for HoverVisitor<'a> {
                     kind: SymbolKind::FUNCTION,
                     // convert special-offset-type(which is range value in here) into u32 type
                     location: fn_name_range,
+                    detail: Some(function_signature(&node)),
                 },
             );
         }
@@ -249,14 +302,13 @@ impl LanguageServer for Backend {
 
                 if let Some(name) = &visitor.found_name {
                     if let Some(fn_info) = visitor.symbol_table.get(name) {
+                        let hover_text = match &fn_info.detail {
+                            Some(detail) => format!("{}\nkind: {:?}", detail, fn_info.kind),
+                            None => format!("{}\nkind: {:?}", fn_info.name, fn_info.kind),
+                        };
+
                         return Ok(Some(Hover {
-                            contents: HoverContents::Scalar(MarkedString::String(format!(
-                                "{}\nkind: {:?}\nlocation: {}..{}",
-                                fn_info.name,
-                                fn_info.kind,
-                                fn_info.location.start,
-                                fn_info.location.end
-                            ))),
+                            contents: HoverContents::Scalar(MarkedString::String(hover_text)),
                             range: None,
                         }));
                     }
