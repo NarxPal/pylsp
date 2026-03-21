@@ -7,10 +7,10 @@ use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, MarkedString, MessageType, Position,
-    ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
-    TextDocumentSyncKind,
+    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    MarkedString, MessageType, Position, Range, ServerCapabilities, SymbolKind, TextDocumentItem,
+    TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{
     Client, LanguageServer,
@@ -82,6 +82,27 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     }
 }
 
+fn offset_to_lsp_position(text: &str, offset: usize) -> Position {
+    let mut current_line = 0u32;
+    let mut current_col_utf16 = 0u32;
+
+    for (byte_offset, ch) in text.char_indices() {
+        if byte_offset >= offset {
+            break;
+        }
+
+        if ch == '\n' {
+            current_line += 1;
+            current_col_utf16 = 0;
+            continue;
+        }
+
+        current_col_utf16 += ch.len_utf16() as u32;
+    }
+
+    Position::new(current_line, current_col_utf16)
+}
+
 fn function_name_range(text: &str, node: &StmtFunctionDef) -> Option<StdRange<u32>> {
     let range = node.range;
     let start = range.start().to_usize();
@@ -147,6 +168,20 @@ fn render_expr(expr: &Expr) -> String {
     }
 }
 
+fn create_diagnostic(range: Range, message: String) -> Diagnostic {
+    Diagnostic {
+        range, // tells the editor which chars to highlight with squiggle
+        severity: Some(DiagnosticSeverity::ERROR), // Red squiggle
+        code: None, // code here refers to error code like E001
+        source: Some("pylsp".to_string()), // extension source
+        message, // description of error
+        related_information: None,
+        tags: None,
+        data: None,
+        code_description: None, // link to specific doc for the specific error
+    }
+}
+
 impl<'a> Visitor for HoverVisitor<'a> {
     //visit_expr_name, will find the variable name
     fn visit_expr_name(&mut self, node: ExprName) {
@@ -189,6 +224,9 @@ impl Backend {
         let parsed_ast = match ast::Suite::parse(&text, uri.as_str()) {
             Ok(suite) => {
                 self.client
+                    .publish_diagnostics(uri.clone(), vec![], None)
+                    .await;
+                self.client
                     .log_message(
                         MessageType::INFO,
                         format!("Successfully parsed {} statements", suite.len()),
@@ -197,10 +235,21 @@ impl Backend {
                 Some(suite)
             }
             Err(err) => {
+                let error_position = offset_to_lsp_position(&text, err.offset.to_usize());
+                let diagnostic = create_diagnostic(
+                    Range::new(error_position, error_position),
+                    format!("Syntax Error: {}", err.error),
+                );
+
+                self.client
+                    .publish_diagnostics(uri.clone(), vec![diagnostic], None)
+                    .await;
+
                 // You can log errors here once for both open/change
                 self.client
                     .log_message(MessageType::LOG, format!("AST Parse Error: {}", err))
                     .await;
+
                 None
             }
         };
