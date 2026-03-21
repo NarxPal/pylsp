@@ -32,7 +32,7 @@ struct SymbolInfo {
 }
 
 struct HoverVisitor<'a> {
-    text: &'a str, // lifetime annotation
+    text: &'a str, // ('a) lifetime annotation
     pub symbol_table: HashMap<String, SymbolInfo>,
     target_offset: u32,
     found_name: Option<String>, // node/word found in the statement(entire line)
@@ -88,19 +88,41 @@ fn offset_to_lsp_position(text: &str, offset: usize) -> Position {
 
     for (byte_offset, ch) in text.char_indices() {
         if byte_offset >= offset {
+            // offset: starting byte position where error was detected
             break;
         }
 
         if ch == '\n' {
-            current_line += 1;
-            current_col_utf16 = 0;
+            current_line += 1; // increment line counter 
+            current_col_utf16 = 0; // start counting from 0 
             continue;
         }
 
+        // .len_utf16(): since lsp require column position to be counted in UTF-16 code units
         current_col_utf16 += ch.len_utf16() as u32;
     }
 
     Position::new(current_line, current_col_utf16)
+}
+
+fn apply_incremental_change(
+    text: &mut String,
+    range: Range,
+    replacement: &str,
+) -> std::result::Result<(), String> {
+    let start = lsp_position_to_offset(text, range.start)
+        .map(|offset| offset as usize) //since range require usize type
+        .ok_or_else(|| format!("invalid start position: {:?}", range.start))?;
+    let end = lsp_position_to_offset(text, range.end)
+        .map(|offset| offset as usize)
+        .ok_or_else(|| format!("invalid end position: {:?}", range.end))?;
+
+    if start > end {
+        return Err("change start is after end".to_string());
+    }
+
+    text.replace_range(start..end, replacement);
+    Ok(())
 }
 
 fn function_name_range(text: &str, node: &StmtFunctionDef) -> Option<StdRange<u32>> {
@@ -253,7 +275,7 @@ impl Backend {
                 None
             }
         };
-
+        // update file in memory
         self.files.insert(uri, (text, parsed_ast));
     }
 }
@@ -267,7 +289,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 // handles how lsp server gets notified of file changes (it could be either save, close, open or edit)
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
 
                 // enable hover tooltip when user hover over their code in ide
@@ -310,9 +332,32 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "did_change received")
             .await;
 
-        if let Some(change) = params.content_changes.into_iter().next() {
-            self.update_file(params.text_document.uri, change.text)
-                .await;
+        let uri = params.text_document.uri;
+
+        // entry: refer to tuple (String, Option<Suite>)
+        if let Some(mut entry) = self.files.get_mut(&uri) {
+            // params.content_changes is a vec
+            for change in params.content_changes {
+                if let Some(range) = change.range {
+                    if let Err(err) = apply_incremental_change(&mut entry.0, range, &change.text) {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("failed to apply incremental change: {}", err),
+                            )
+                            .await;
+                        return;
+                    }
+                }
+                // if no range field(which mean no changes), than "change.text" will contain entire file text
+                else {
+                    entry.0 = change.text;
+                }
+            }
+
+            let updated_text = entry.0.clone();
+            drop(entry);
+            self.update_file(uri, updated_text).await;
         }
     }
 
@@ -387,8 +432,8 @@ async fn main() {
     /*
     summary:
 
-        // service, is actual engine that process the incoming req
-        // clientSocket, is a handle used by server to send notification
+        // service: is actual engine that process the incoming req
+        // clientSocket: is a handle used by server to send notification
         // closure returns the Backend which will internally do backend.initialize, .did_change, etc
         */
     let (service, client_socket) = LspService::new(|client| Backend {
@@ -396,9 +441,9 @@ async fn main() {
         files: DashMap::new(),
     });
 
-    // stdin, listen to editor
-    // stdout , send back to editor
-    // client_socket, it lets the server to call the editor
+    // stdin: listen to editor
+    // stdout: send back to editor
+    // client_socket: it lets the server to call the editor
     Server::new(stdin(), stdout(), client_socket)
         // serve, tells the server to use the rules which i provided via service which includes initialize, did_change and shutdown
         .serve(service)
