@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::Range as StdRange;
 
 use dashmap::DashMap;
-use rustpython_ast::{Expr, ExprName, StmtFunctionDef, Suite, Visitor};
+use rustpython_ast::{Expr, ExprName, StmtClassDef, StmtFunctionDef, Suite, Visitor};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
@@ -36,6 +36,32 @@ struct HoverVisitor<'a> {
     pub symbol_table: HashMap<String, SymbolInfo>,
     target_offset: u32,
     found_name: Option<String>, // node/word found in the statement(entire line)
+}
+
+impl<'a> HoverVisitor<'a> {
+    fn record_symbol(
+        &mut self,
+        outer_range: rustpython_parser::text_size::TextRange,
+        name: &str,
+        kind: SymbolKind,
+        detail: Option<String>,
+    ) {
+        if let Some(name_range) = symbol_name_range(self.text, outer_range, name) {
+            if self.target_offset >= name_range.start && self.target_offset < name_range.end {
+                self.found_name = Some(name.to_string());
+            }
+
+            self.symbol_table.insert(
+                name.to_string(),
+                SymbolInfo {
+                    name: name.to_string(),
+                    kind,
+                    location: name_range,
+                    detail,
+                },
+            );
+        }
+    }
 }
 
 fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
@@ -125,13 +151,15 @@ fn apply_incremental_change(
     Ok(())
 }
 
-fn function_name_range(text: &str, node: &StmtFunctionDef) -> Option<StdRange<u32>> {
-    let range = node.range;
-    let start = range.start().to_usize();
-    let end = range.end().to_usize();
+fn symbol_name_range(
+    text: &str,
+    outer_range: rustpython_parser::text_size::TextRange, // directly using TextRange struct, instead of taking specific ast node type(eg. StmtFunctionDef, StmtClassDef)
+    name: &str,
+) -> Option<StdRange<u32>> {
+    let start = outer_range.start().to_usize();
+    let end = outer_range.end().to_usize();
     let snippet = &text[start..end];
 
-    let name = node.name.as_str();
     let local_start = snippet.find(name)?;
     let abs_start = start + local_start;
     let abs_end = abs_start + name.len();
@@ -221,28 +249,26 @@ impl<'a> Visitor for HoverVisitor<'a> {
     }
 
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        if let Some(fn_name_range) = function_name_range(self.text, &node) {
-            let start = fn_name_range.start;
-            let end = fn_name_range.end;
-
-            if self.target_offset >= start && self.target_offset < end {
-                self.found_name = Some(node.name.to_string());
-            }
-
-            self.symbol_table.insert(
-                node.name.to_string(), // this is fn name and not ExprName
-                SymbolInfo {
-                    name: node.name.to_string(),
-                    kind: SymbolKind::FUNCTION,
-                    // convert special-offset-type(which is range value in here) into u32 type
-                    location: fn_name_range,
-                    detail: Some(function_signature(&node)),
-                },
-            );
-        }
+        self.record_symbol(
+            node.range,
+            node.name.as_str(),
+            SymbolKind::FUNCTION,
+            Some(function_signature(&node)),
+        );
 
         // this default method, will walk inside the fn node, which includes it's body and related nodes
         self.generic_visit_stmt_function_def(node);
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        self.record_symbol(
+            node.range,
+            node.name.as_str(),
+            SymbolKind::CLASS,
+            Some(format!("class {}", node.name)),
+        );
+
+        self.generic_visit_stmt_class_def(node);
     }
 }
 
