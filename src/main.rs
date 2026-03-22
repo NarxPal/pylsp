@@ -205,7 +205,7 @@ fn create_diagnostic(range: Range, message: String) -> Diagnostic {
 }
 
 impl<'a> Visitor for HoverVisitor<'a> {
-    //visit_expr_name, will find the variable name
+    //visit_expr_name: will find the variable name
     fn visit_expr_name(&mut self, node: ExprName) {
         // range: stores the source code location, basically col and line no.
         let range = node.range;
@@ -222,6 +222,13 @@ impl<'a> Visitor for HoverVisitor<'a> {
 
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         if let Some(fn_name_range) = function_name_range(self.text, &node) {
+            let start = fn_name_range.start;
+            let end = fn_name_range.end;
+
+            if self.target_offset >= start && self.target_offset < end {
+                self.found_name = Some(node.name.to_string());
+            }
+
             self.symbol_table.insert(
                 node.name.to_string(), // this is fn name and not ExprName
                 SymbolInfo {
@@ -387,7 +394,10 @@ impl LanguageServer for Backend {
                 };
 
                 for stmt in suite {
-                    // visit_stmt take one node and start traversing/visiting it
+                    /*  visit_stmt take one node and start traversing/visiting it.
+                        visit_stmt calls visit_stmt_function_def.
+                        which than call generic_visit_stmt_function_def which will decide whether it's fn or expr name.
+                    */
                     visitor.visit_stmt(stmt.clone());
                     if visitor.found_name.is_some() {
                         break; // exit for loop once name is found
