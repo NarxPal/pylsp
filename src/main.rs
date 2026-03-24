@@ -8,8 +8,9 @@ use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    MarkedString, MessageType, Position, Range, ServerCapabilities, SymbolKind, TextDocumentItem,
+    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, Location, MarkedString, MessageType, OneOf, Position,
+    Range, ReferenceParams, ServerCapabilities, SymbolKind, TextDocumentItem,
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{
@@ -64,6 +65,7 @@ impl<'a> HoverVisitor<'a> {
     }
 }
 
+// convert {line, char} to range
 fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     let mut current_line = 0u32;
     let mut current_col_utf16 = 0u32;
@@ -108,6 +110,7 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     }
 }
 
+// convert range to {line, char}
 fn offset_to_lsp_position(text: &str, offset: usize) -> Position {
     let mut current_line = 0u32;
     let mut current_col_utf16 = 0u32;
@@ -273,6 +276,32 @@ impl<'a> Visitor for HoverVisitor<'a> {
 }
 
 impl Backend {
+    fn find_symbol_at_offset<'a>(
+        text: &'a str,
+        suite: &'a Suite,
+        target_offset: u32,
+    ) -> HoverVisitor<'a> {
+        let mut visitor = HoverVisitor {
+            text,
+            symbol_table: HashMap::new(),
+            target_offset,
+            found_name: None,
+        };
+
+        /*  visit_stmt take one node and start traversing/visiting it.
+            visit_stmt calls visit_stmt_function_def.
+            which than call generic_visit_stmt_function_def which will decide whether it's fn or expr name.
+        */
+        for stmt in suite {
+            visitor.visit_stmt(stmt.clone());
+            if visitor.found_name.is_some() {
+                break;
+            }
+        }
+
+        visitor
+    }
+
     // custom helper method to avoid repetitiveness
     async fn update_file(&self, uri: Url, text: String) {
         // One place for parsing logic
@@ -327,6 +356,11 @@ impl LanguageServer for Backend {
 
                 // enable hover tooltip when user hover over their code in ide
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+
+                definition_provider: Some(OneOf::Left(true)),
+
+                references_provider: Some(OneOf::Left(true)),
+
                 ..ServerCapabilities::default() // let other fields stay as they are as defaults
             },
             ..Default::default()
@@ -394,6 +428,78 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.client
+            .log_message(MessageType::INFO, "goto_definition ran")
+            .await;
+
+        let uri = params.text_document_position_params.text_document.uri;
+        // position: tells the line & character where hover occured
+        let position = params.text_document_position_params.position;
+
+        if let Some(entry) = self.files.get(&uri) {
+            // text: String, maybe_ast: Option<suite> for key "uri"
+            let (text, maybe_ast) = entry.value();
+
+            // nested pattern matching
+            if let (Some(target_offset), Some(suite)) =
+                (lsp_position_to_offset(text, position), maybe_ast)
+            {
+                let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
+
+                if let Some(name) = &visitor.found_name {
+                    if let Some(symbol) = visitor.symbol_table.get(name) {
+                        let definition_range = Range::new(
+                            offset_to_lsp_position(text, symbol.location.start as usize),
+                            offset_to_lsp_position(text, symbol.location.end as usize),
+                        );
+
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+                            uri.clone(),
+                            definition_range,
+                        ))));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    // async fn references(&self, params: ReferenceParams) {
+    //     self.client
+    //         .log_message(MessageType::INFO, "references ran")
+    //         .await;
+
+    //     // position: tells the line & character where hover occured
+    //     let position = params.text_document_position.position;
+
+    //     let uri = params.text_document_position.text_document.uri;
+
+    //     if let Some(entry) = self.files.get(&uri) {
+    //         let (text, maybe_ast) = entry.value();
+
+    //         // nested pattern matching
+    //         if let (Some(target_offset), Some(suite)) =
+    //             (lsp_position_to_offset(text, position), maybe_ast)
+    //         {
+    //             let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
+
+    //             if let Some(name) = &visitor.found_name {
+
+    //                 // return Some((Ok(Some((locations)))))
+    //             }
+    //         }
+    //     }
+
+    // let include_declaration = params.context.include_declaration;
+
+    // let mut locations = Vec::new();
+    // }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         self.client
             .log_message(MessageType::INFO, "hover msg received")
@@ -411,24 +517,7 @@ impl LanguageServer for Backend {
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
-                // visitor will contains
-                let mut visitor = HoverVisitor {
-                    text: text,
-                    symbol_table: HashMap::new(),
-                    target_offset,
-                    found_name: None,
-                };
-
-                for stmt in suite {
-                    /*  visit_stmt take one node and start traversing/visiting it.
-                        visit_stmt calls visit_stmt_function_def.
-                        which than call generic_visit_stmt_function_def which will decide whether it's fn or expr name.
-                    */
-                    visitor.visit_stmt(stmt.clone());
-                    if visitor.found_name.is_some() {
-                        break; // exit for loop once name is found
-                    }
-                }
+                let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
 
                 if let Some(name) = &visitor.found_name {
                     if let Some(fn_info) = visitor.symbol_table.get(name) {
