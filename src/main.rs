@@ -35,8 +35,13 @@ struct SymbolInfo {
 struct HoverVisitor<'a> {
     text: &'a str, // ('a) lifetime annotation
     pub symbol_table: HashMap<String, SymbolInfo>,
-    target_offset: u32,
+    target_offset: u32,         // range
     found_name: Option<String>, // node/word found in the statement(entire line)
+}
+
+struct ReferencesVisitor {
+    target_name: String, // symbol_name
+    locations: Vec<StdRange<u32>>,
 }
 
 impl<'a> HoverVisitor<'a> {
@@ -65,7 +70,7 @@ impl<'a> HoverVisitor<'a> {
     }
 }
 
-// convert {line, char} to range
+// convert {line, char} to byte_number
 fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     let mut current_line = 0u32;
     let mut current_col_utf16 = 0u32;
@@ -110,7 +115,7 @@ fn lsp_position_to_offset(text: &str, position: Position) -> Option<u32> {
     }
 }
 
-// convert range to {line, char}
+// convert byte_number to {line, char}
 fn offset_to_lsp_position(text: &str, offset: usize) -> Position {
     let mut current_line = 0u32;
     let mut current_col_utf16 = 0u32;
@@ -275,6 +280,33 @@ impl<'a> Visitor for HoverVisitor<'a> {
     }
 }
 
+impl Visitor for ReferencesVisitor {
+    fn visit_expr_name(&mut self, node: ExprName) {
+        if node.id.as_str() == self.target_name {
+            self.locations
+                .push(node.range.start().to_u32()..node.range.end().to_u32());
+        }
+
+        self.generic_visit_expr_name(node);
+    }
+
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        if node.name.as_str() == self.target_name {
+            self.locations
+                .push(node.range.start().to_u32()..node.range.end().to_u32());
+        }
+        self.generic_visit_stmt_function_def(node);
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        if node.name.as_str() == self.target_name {
+            self.locations
+                .push(node.range.start().to_u32()..node.range.end().to_u32());
+        }
+        self.generic_visit_stmt_class_def(node);
+    }
+}
+
 impl Backend {
     fn find_symbol_at_offset<'a>(
         text: &'a str,
@@ -360,7 +392,6 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
 
                 references_provider: Some(OneOf::Left(true)),
-
                 ..ServerCapabilities::default() // let other fields stay as they are as defaults
             },
             ..Default::default()
@@ -469,36 +500,52 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    // async fn references(&self, params: ReferenceParams) {
-    //     self.client
-    //         .log_message(MessageType::INFO, "references ran")
-    //         .await;
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.client
+            .log_message(MessageType::INFO, "references ran")
+            .await;
 
-    //     // position: tells the line & character where hover occured
-    //     let position = params.text_document_position.position;
+        // position: tells the line & character where hover occured
+        let position = params.text_document_position.position;
 
-    //     let uri = params.text_document_position.text_document.uri;
+        let uri = params.text_document_position.text_document.uri;
 
-    //     if let Some(entry) = self.files.get(&uri) {
-    //         let (text, maybe_ast) = entry.value();
+        if let Some(entry) = self.files.get(&uri) {
+            let (text, maybe_ast) = entry.value();
 
-    //         // nested pattern matching
-    //         if let (Some(target_offset), Some(suite)) =
-    //             (lsp_position_to_offset(text, position), maybe_ast)
-    //         {
-    //             let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
+            // nested pattern matching
+            if let (Some(target_offset), Some(suite)) =
+                (lsp_position_to_offset(text, position), maybe_ast)
+            {
+                let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
 
-    //             if let Some(name) = &visitor.found_name {
+                if let Some(name) = &visitor.found_name {
+                    let mut references_visitor = ReferencesVisitor {
+                        target_name: name.clone(),
+                        locations: Vec::new(),
+                    };
 
-    //                 // return Some((Ok(Some((locations)))))
-    //             }
-    //         }
-    //     }
+                    for stmt in suite {
+                        references_visitor.visit_stmt(stmt.clone());
+                    }
 
-    // let include_declaration = params.context.include_declaration;
+                    let mut locations = Vec::new();
 
-    // let mut locations = Vec::new();
-    // }
+                    for location in references_visitor.locations {
+                        let range = Range::new(
+                            offset_to_lsp_position(text, location.start as usize),
+                            offset_to_lsp_position(text, location.end as usize),
+                        );
+
+                        locations.push(Location::new(uri.clone(), range));
+                    }
+                    return Ok(Some(locations));
+                }
+            }
+        }
+
+        Ok(None)
+    }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         self.client
