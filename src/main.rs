@@ -47,6 +47,13 @@ struct ReferencesVisitor {
     locations: Vec<StdRange<u32>>,
 }
 
+struct ParseErrorDetail<'a> {
+    path: &'a PathBuf,
+    text: String, // file content
+    line: u32,
+    column: u32,
+}
+
 impl<'a> HoverVisitor<'a> {
     fn record_symbol(
         &mut self,
@@ -628,15 +635,30 @@ fn run_batch_bench(root: &Path) {
     // count how many .py files parsing succeeded and failed
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut diagnostic_err = 0usize;
+    let mut err_in_files: Vec<ParseErrorDetail> = Vec::new();
 
     for path in &files {
         match fs::read_to_string(path) {
             Ok(text) => {
                 // to_string_lossy: converts C-style string into rust String
-                if ast::Suite::parse(&text, &path.to_string_lossy()).is_ok() {
-                    passed += 1;
-                } else {
-                    failed += 1;
+                match ast::Suite::parse(&text, &path.to_string_lossy()) {
+                    Ok(_) => {
+                        passed += 1;
+                    }
+                    Err(parse_err) => {
+                        failed += 1;
+                        diagnostic_err += 1;
+
+                        let pos = offset_to_lsp_position(&text, parse_err.offset.to_usize());
+
+                        err_in_files.push(ParseErrorDetail {
+                            path,
+                            text: parse_err.to_string(),
+                            line: pos.line + 1, // editor line start from 1 and not 0
+                            column: pos.line + 1,
+                        })
+                    }
                 }
             }
             Err(_) => {
@@ -649,6 +671,7 @@ fn run_batch_bench(root: &Path) {
     println!("files: {}", files.len()); // total number of file paths
     println!("passed: {}", passed);
     println!("failed: {}", failed);
+    println!("diagnostic err files: {}", diagnostic_err);
     println!("elapsed_ms: {}", elapsed.as_millis());
     if elapsed.as_secs_f64() > 0.0 {
         println!(
@@ -656,6 +679,18 @@ fn run_batch_bench(root: &Path) {
             // convert files.len into f64 for calculating with time
             files.len() as f64 / elapsed.as_secs_f64()
         );
+    }
+
+    if err_in_files.is_empty() {
+        println!("All files parsed successfully!");
+    } else {
+        println!("Found error while parsing bulk files");
+        for err in err_in_files {
+            println!(
+                "File: {:?} at Line: {}, Col: {} - Error: {}",
+                err.path, err.line, err.column, err.text
+            );
+        }
     }
 }
 
