@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::ops::Range as StdRange;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use std::{env, fs};
 
 use dashmap::DashMap;
 use rustpython_ast::{Expr, ExprName, StmtClassDef, StmtFunctionDef, Suite, Visitor};
@@ -599,8 +602,73 @@ impl LanguageServer for Backend {
     }
 }
 
+fn collect_py_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // if it's a folder
+            if path.is_dir() {
+                collect_py_files(&path, out);
+            }
+            // if it's a file
+            else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn run_batch_bench(root: &Path) {
+    // pathbuf: a string which can handle path quirks like (\ or /)
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_py_files(root, &mut files);
+
+    // instant: it's used for measuring the batched files parsing
+    let start = Instant::now();
+    // count how many .py files parsing succeeded and failed
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    for path in &files {
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                // to_string_lossy: converts C-style string into rust String
+                if ast::Suite::parse(&text, &path.to_string_lossy()).is_ok() {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            Err(_) => {
+                failed += 1;
+            }
+        }
+    }
+    // total time spent since instant(start) was created
+    let elapsed = start.elapsed();
+    println!("files: {}", files.len()); // total number of file paths
+    println!("passed: {}", passed);
+    println!("failed: {}", failed);
+    println!("elapsed_ms: {}", elapsed.as_millis());
+    if elapsed.as_secs_f64() > 0.0 {
+        println!(
+            "files_per_sec: {:.2}", // round to two decimal places
+            // convert files.len into f64 for calculating with time
+            files.len() as f64 / elapsed.as_secs_f64()
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    // --bench is custom arg
+    if args.len() >= 3 && args[1] == "--bench" {
+        println!("bench mode ");
+        run_batch_bench(Path::new(&args[2]));
+        return;
+    }
+
     /*
     summary:
 
