@@ -326,15 +326,8 @@ impl Visitor for ReferencesVisitor {
 impl<'a> Visitor for DocumentSymbolVisitor<'a> {
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
-            let selection_range = Range::new(
-                offset_to_lsp_position(self.text, name_range.start as usize),
-                offset_to_lsp_position(self.text, name_range.end as usize),
-            );
-
-            let range = Range::new(
-                offset_to_lsp_position(self.text, node.range.start().to_usize()),
-                offset_to_lsp_position(self.text, node.range.end().to_usize()),
-            );
+            let selection_range = self.to_lsp_range(name_range);
+            let range = self.to_lsp_range(node.range.start().to_u32()..node.range.end().to_u32());
 
             self.symbols.push(DocumentSymbol {
                 name: node.name.to_string(),
@@ -352,6 +345,22 @@ impl<'a> Visitor for DocumentSymbolVisitor<'a> {
     }
 
     fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            let selection_range = self.to_lsp_range(name_range);
+            let range = self.to_lsp_range(node.range.start().to_u32()..node.range.end().to_u32());
+
+            self.symbols.push(DocumentSymbol {
+                name: node.name.to_string(),
+                detail: None,
+                kind: SymbolKind::CLASS,
+                tags: None,
+                deprecated: None,
+                range: range,
+                selection_range: selection_range,
+                children: None,
+            });
+        }
+
         self.generic_visit_stmt_class_def(node);
     }
 }
@@ -420,6 +429,15 @@ impl Backend {
         };
         // update file in memory
         self.files.insert(uri, (text, parsed_ast));
+    }
+}
+
+impl<'a> DocumentSymbolVisitor<'a> {
+    fn to_lsp_range(&self, range: StdRange<u32>) -> Range {
+        Range::new(
+            offset_to_lsp_position(self.text, range.start as usize),
+            offset_to_lsp_position(self.text, range.end as usize),
+        )
     }
 }
 
