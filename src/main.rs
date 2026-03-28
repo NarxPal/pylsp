@@ -11,10 +11,11 @@ use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, Location, MarkedString, MessageType, OneOf, Position,
-    Range, ReferenceParams, ServerCapabilities, SymbolKind, TextDocumentItem,
-    TextDocumentSyncCapability, TextDocumentSyncKind,
+    DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, Location, MarkedString, MessageType, OneOf, Position, Range,
+    ReferenceParams, ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
+    TextDocumentSyncKind,
 };
 use tower_lsp::{
     Client, LanguageServer,
@@ -45,6 +46,11 @@ struct HoverVisitor<'a> {
 struct ReferencesVisitor {
     target_name: String, // symbol_name
     locations: Vec<StdRange<u32>>,
+}
+
+struct DocumentSymbolVisitor<'a> {
+    text: &'a str,
+    symbols: Vec<DocumentSymbol>,
 }
 
 struct ParseErrorDetail<'a> {
@@ -178,7 +184,7 @@ fn symbol_name_range(
     let end = outer_range.end().to_usize();
     let snippet = &text[start..end];
 
-    let local_start = snippet.find(name)?;
+    let local_start = snippet.find(name)?; //get the name from func/class definition
     let abs_start = start + local_start;
     let abs_end = abs_start + name.len();
 
@@ -317,6 +323,39 @@ impl Visitor for ReferencesVisitor {
     }
 }
 
+impl<'a> Visitor for DocumentSymbolVisitor<'a> {
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            let selection_range = Range::new(
+                offset_to_lsp_position(self.text, name_range.start as usize),
+                offset_to_lsp_position(self.text, name_range.end as usize),
+            );
+
+            let range = Range::new(
+                offset_to_lsp_position(self.text, node.range.start().to_usize()),
+                offset_to_lsp_position(self.text, node.range.end().to_usize()),
+            );
+
+            self.symbols.push(DocumentSymbol {
+                name: node.name.to_string(),
+                detail: None,
+                kind: SymbolKind::FUNCTION,
+                tags: None,
+                deprecated: None,
+                range: range,
+                selection_range: selection_range,
+                children: None,
+            });
+        }
+
+        self.generic_visit_stmt_function_def(node);
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        self.generic_visit_stmt_class_def(node);
+    }
+}
+
 impl Backend {
     fn find_symbol_at_offset<'a>(
         text: &'a str,
@@ -402,6 +441,9 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
 
                 references_provider: Some(OneOf::Left(true)),
+
+                document_symbol_provider: Some(OneOf::Left(true)),
+
                 ..ServerCapabilities::default() // let other fields stay as they are as defaults
             },
             ..Default::default()
@@ -557,6 +599,37 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        self.client
+            .log_message(MessageType::INFO, "fetch outline ran")
+            .await;
+
+        let uri = params.text_document.uri;
+
+        if let Some(entry) = self.files.get(&uri) {
+            // text: String, maybe_ast: Option<suite> for key "uri"
+            let (text, maybe_ast) = entry.value();
+
+            let mut symbol_visitor = DocumentSymbolVisitor {
+                text,
+                symbols: Vec::new(),
+            };
+
+            if let Some(suite) = maybe_ast {
+                for stmt in suite {
+                    symbol_visitor.visit_stmt(stmt.clone());
+                }
+            }
+
+            return Ok(Some(DocumentSymbolResponse::Nested(symbol_visitor.symbols)));
+        }
+
+        Ok(None)
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         self.client
             .log_message(MessageType::INFO, "hover msg received")
@@ -637,10 +710,13 @@ fn run_batch_bench(root: &Path) {
     let mut failed = 0usize;
     let mut diagnostic_err = 0usize;
     let mut err_in_files: Vec<ParseErrorDetail> = Vec::new();
+    let mut total_lines_parsed = 0usize;
 
     for path in &files {
         match fs::read_to_string(path) {
             Ok(text) => {
+                total_lines_parsed += text.lines().count();
+
                 // to_string_lossy: converts C-style string into rust String
                 match ast::Suite::parse(&text, &path.to_string_lossy()) {
                     Ok(_) => {
@@ -669,6 +745,7 @@ fn run_batch_bench(root: &Path) {
     // total time spent since instant(start) was created
     let elapsed = start.elapsed();
     println!("files: {}", files.len()); // total number of file paths
+    println!("total number of lines parsed: {}", total_lines_parsed);
     println!("passed: {}", passed);
     println!("failed: {}", failed);
     println!("diagnostic err files: {}", diagnostic_err);
