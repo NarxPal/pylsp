@@ -2,9 +2,6 @@ def greet(name: str) -> str:
     message = f"hellow, {name}"
     return message
 
-
-
-
 class User:
     def __init__(self, username: str) -> None:
         self.username = username
@@ -20,6 +17,21 @@ class Account:
 
 def display_name():
     print("hello")
+
+
+
+name = "global"
+
+def outer(name):
+    x = 1
+
+    def inner(name):
+        y = name
+        return y
+
+    return name
+
+
 
 
 user = User("narendra")

@@ -32,7 +32,6 @@ struct Backend {
 struct SymbolInfo {
     name: String,
     kind: SymbolKind, // eg. variable, func, class
-    location: StdRange<u32>,
     detail: Option<String>, // using "Option" since not every symbol will have detail
 }
 
@@ -41,11 +40,6 @@ struct HoverVisitor<'a> {
     pub symbol_table: HashMap<String, SymbolInfo>,
     target_offset: u32,         // range
     found_name: Option<String>, // node/word found in the statement(entire line)
-}
-
-struct ReferencesVisitor {
-    target_name: String, // symbol_name
-    locations: Vec<StdRange<u32>>,
 }
 
 struct DocumentSymbolVisitor<'a> {
@@ -60,6 +54,7 @@ struct ParseErrorDetail<'a> {
     column: u32,
 }
 
+#[derive(Clone, Debug)]
 struct Binding {
     name: String,
     kind: SymbolKind,
@@ -71,9 +66,18 @@ struct Scope {
 }
 
 // for module-level scope
-// for eg. scopes = [module/global, function]
-struct ScopeStack {
+struct ScopeStack<'a> {
+    text: &'a str,
+    scopes: Vec<Scope>, // for eg. scopes = Vec[module/global, function]
+    target_offset: u32,
+    resolved_binding: Option<Binding>,
+}
+
+struct ScopedReferencesVisitor<'a> {
+    text: &'a str,
+    target: Binding,
     scopes: Vec<Scope>,
+    locations: Vec<StdRange<u32>>,
 }
 
 impl<'a> HoverVisitor<'a> {
@@ -94,7 +98,6 @@ impl<'a> HoverVisitor<'a> {
                 SymbolInfo {
                     name: name.to_string(),
                     kind,
-                    location: name_range,
                     detail,
                 },
             );
@@ -312,33 +315,6 @@ impl<'a> Visitor for HoverVisitor<'a> {
     }
 }
 
-impl Visitor for ReferencesVisitor {
-    fn visit_expr_name(&mut self, node: ExprName) {
-        if node.id.as_str() == self.target_name {
-            self.locations
-                .push(node.range.start().to_u32()..node.range.end().to_u32());
-        }
-
-        self.generic_visit_expr_name(node);
-    }
-
-    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        if node.name.as_str() == self.target_name {
-            self.locations
-                .push(node.range.start().to_u32()..node.range.end().to_u32());
-        }
-        self.generic_visit_stmt_function_def(node);
-    }
-
-    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
-        if node.name.as_str() == self.target_name {
-            self.locations
-                .push(node.range.start().to_u32()..node.range.end().to_u32());
-        }
-        self.generic_visit_stmt_class_def(node);
-    }
-}
-
 impl<'a> Visitor for DocumentSymbolVisitor<'a> {
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
@@ -381,28 +357,183 @@ impl<'a> Visitor for DocumentSymbolVisitor<'a> {
     }
 }
 
-impl Visitor for ScopeStack {
+impl<'a> ScopeStack<'a> {
+    fn bind_current(&mut self, name: String, binding: Binding) {
+        // last_mut: will get the "new Scope object" from stmt_fn_def
+        // last_mut: to get last element(last/current scope)
+        if let Some(current_scope) = self.scopes.last_mut() {
+            current_scope.bindings.insert(name, binding);
+        }
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<Binding> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name).cloned())
+    }
+}
+
+impl<'a> ScopedReferencesVisitor<'a> {
+    fn bind_current(&mut self, name: String, binding: Binding) {
+        if let Some(current_scope) = self.scopes.last_mut() {
+            current_scope.bindings.insert(name, binding);
+        }
+    }
+
+    fn resolve_name(&self, name: &str) -> Option<Binding> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name).cloned())
+    }
+
+    fn matches_target(&self, binding: &Binding) -> bool {
+        binding.name == self.target.name && binding.range == self.target.range
+    }
+}
+
+impl<'a> Visitor for ScopeStack<'a> {
+    fn visit_expr_name(&mut self, node: ExprName) {
+        let start = node.range.start().to_u32();
+        let end = node.range.end().to_u32();
+
+        if self.target_offset >= start && self.target_offset < end {
+            self.resolved_binding = self.resolve_name(node.id.as_str());
+        }
+
+        self.generic_visit_expr_name(node);
+    }
+
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
         for target in &node.targets {
             if let Expr::Name(name_expr) = target {
-                // last_mut: to get last element(last/current scope)
-                if let Some(current_scope) = self.scopes.last_mut() {
-                    current_scope.bindings.insert(
-                        name_expr.id.to_string(),
-                        Binding {
-                            name: name_expr.id.to_string(),
-                            kind: SymbolKind::VARIABLE,
-                            range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
-                        },
-                    );
-                }
+                self.bind_current(
+                    name_expr.id.to_string(),
+                    Binding {
+                        name: name_expr.id.to_string(),
+                        kind: SymbolKind::VARIABLE,
+                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                    },
+                )
             }
         }
 
         self.generic_visit_stmt_assign(node);
     }
 
-    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {}
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            // bind_current is called before .push since fn name will be in module scope
+            let fn_binding = Binding {
+                name: node.name.to_string(),
+                kind: SymbolKind::FUNCTION,
+                range: name_range.clone(),
+            };
+
+            if self.target_offset >= name_range.start && self.target_offset < name_range.end {
+                self.resolved_binding = Some(fn_binding.clone());
+            }
+
+            self.bind_current(
+                node.name.to_string(),
+                fn_binding,
+            );
+        }
+
+        self.scopes.push(Scope {
+            bindings: HashMap::new(), // new Scope object
+        });
+
+        // arg is the fn param node
+        for arg in &node.args.args {
+            let binding = Binding {
+                name: arg.def.arg.to_string(),
+                kind: SymbolKind::VARIABLE, // Variable here refer to params
+                range: arg.def.range.start().to_u32()..arg.def.range.end().to_u32(), // arg.def refer to param node which contains name, param type, range
+            };
+
+            if self.target_offset >= binding.range.start && self.target_offset < binding.range.end {
+                self.resolved_binding = Some(binding.clone());
+            }
+
+            self.bind_current(
+                // fn params name is stored in arg.def.arg
+                arg.def.arg.to_string(),
+                binding,
+            );
+        }
+
+        self.generic_visit_stmt_function_def(node);
+        self.scopes.pop(); // remove fn_scope from Scope
+    }
+}
+
+impl<'a> Visitor for ScopedReferencesVisitor<'a> {
+    fn visit_expr_name(&mut self, node: ExprName) {
+        if let Some(binding) = self.resolve_name(node.id.as_str()) {
+            if self.matches_target(&binding) {
+                self.locations
+                    .push(node.range.start().to_u32()..node.range.end().to_u32());
+            }
+        }
+
+        self.generic_visit_expr_name(node);
+    }
+
+    fn visit_stmt_assign(&mut self, node: StmtAssign) {
+        for target in &node.targets {
+            if let Expr::Name(name_expr) = target {
+                self.bind_current(
+                    name_expr.id.to_string(),
+                    Binding {
+                        name: name_expr.id.to_string(),
+                        kind: SymbolKind::VARIABLE,
+                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                    },
+                );
+            }
+        }
+
+        self.generic_visit_stmt_assign(node);
+    }
+
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            let fn_binding = Binding {
+                name: node.name.to_string(),
+                kind: SymbolKind::FUNCTION,
+                range: name_range.clone(),
+            };
+
+            if self.matches_target(&fn_binding) {
+                self.locations.push(name_range);
+            }
+
+            self.bind_current(node.name.to_string(), fn_binding);
+        }
+
+        self.scopes.push(Scope {
+            bindings: HashMap::new(),
+        });
+
+        for arg in &node.args.args {
+            let binding = Binding {
+                name: arg.def.arg.to_string(),
+                kind: SymbolKind::VARIABLE,
+                range: arg.def.range.start().to_u32()..arg.def.range.end().to_u32(),
+            };
+
+            if self.matches_target(&binding) {
+                self.locations.push(binding.range.clone());
+            }
+
+            self.bind_current(arg.def.arg.to_string(), binding);
+        }
+
+        self.generic_visit_stmt_function_def(node);
+        self.scopes.pop();
+    }
 }
 
 impl Backend {
@@ -430,6 +561,26 @@ impl Backend {
         }
 
         visitor
+    }
+
+    fn resolve_binding_at_offset(text: &str, suite: &Suite, target_offset: u32) -> Option<Binding> {
+        let mut visitor = ScopeStack {
+            text,
+            scopes: vec![Scope {
+                bindings: HashMap::new(),
+            }],
+            target_offset,
+            resolved_binding: None,
+        };
+
+        for stmt in suite {
+            visitor.visit_stmt(stmt.clone());
+            if visitor.resolved_binding.is_some() {
+                break;
+            }
+        }
+
+        visitor.resolved_binding
     }
 
     // custom helper method to avoid repetitiveness
@@ -589,20 +740,17 @@ impl LanguageServer for Backend {
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
-                let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
+                if let Some(binding) = Backend::resolve_binding_at_offset(text, suite, target_offset)
+                {
+                    let definition_range = Range::new(
+                        offset_to_lsp_position(text, binding.range.start as usize),
+                        offset_to_lsp_position(text, binding.range.end as usize),
+                    );
 
-                if let Some(name) = &visitor.found_name {
-                    if let Some(symbol) = visitor.symbol_table.get(name) {
-                        let definition_range = Range::new(
-                            offset_to_lsp_position(text, symbol.location.start as usize),
-                            offset_to_lsp_position(text, symbol.location.end as usize),
-                        );
-
-                        return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
-                            uri.clone(),
-                            definition_range,
-                        ))));
-                    }
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+                        uri.clone(),
+                        definition_range,
+                    ))));
                 }
             }
         }
@@ -627,11 +775,14 @@ impl LanguageServer for Backend {
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
-                let visitor = Backend::find_symbol_at_offset(text, suite, target_offset);
-
-                if let Some(name) = &visitor.found_name {
-                    let mut references_visitor = ReferencesVisitor {
-                        target_name: name.clone(),
+                if let Some(binding) = Backend::resolve_binding_at_offset(text, suite, target_offset)
+                {
+                    let mut references_visitor = ScopedReferencesVisitor {
+                        text,
+                        target: binding,
+                        scopes: vec![Scope {
+                            bindings: HashMap::new(),
+                        }],
                         locations: Vec::new(),
                     };
 
