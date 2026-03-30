@@ -31,7 +31,7 @@ struct Backend {
 #[derive(Debug)]
 struct SymbolInfo {
     name: String,
-    kind: SymbolKind, // eg. variable, func, class
+    kind: SymbolKind,       // eg. variable, func, class
     detail: Option<String>, // using "Option" since not every symbol will have detail
 }
 
@@ -435,10 +435,7 @@ impl<'a> Visitor for ScopeStack<'a> {
                 self.resolved_binding = Some(fn_binding.clone());
             }
 
-            self.bind_current(
-                node.name.to_string(),
-                fn_binding,
-            );
+            self.bind_current(node.name.to_string(), fn_binding);
         }
 
         self.scopes.push(Scope {
@@ -466,6 +463,29 @@ impl<'a> Visitor for ScopeStack<'a> {
 
         self.generic_visit_stmt_function_def(node);
         self.scopes.pop(); // remove fn_scope from Scope
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            let class_binding = Binding {
+                name: node.name.to_string(),
+                kind: SymbolKind::CLASS,
+                range: name_range.clone(),
+            };
+
+            if self.target_offset >= name_range.start && self.target_offset < name_range.end {
+                self.resolved_binding = Some(class_binding.clone());
+            }
+
+            self.bind_current(node.name.to_string(), class_binding);
+        }
+
+        self.scopes.push(Scope {
+            bindings: HashMap::new(),
+        });
+
+        self.generic_visit_stmt_class_def(node);
+        self.scopes.pop();
     }
 }
 
@@ -532,6 +552,29 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
         }
 
         self.generic_visit_stmt_function_def(node);
+        self.scopes.pop();
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
+            let class_binding = Binding {
+                name: node.name.to_string(),
+                kind: SymbolKind::CLASS,
+                range: name_range.clone(),
+            };
+
+            if self.matches_target(&class_binding) {
+                self.locations.push(name_range);
+            }
+
+            self.bind_current(node.name.to_string(), class_binding);
+        }
+
+        self.scopes.push(Scope {
+            bindings: HashMap::new(),
+        });
+
+        self.generic_visit_stmt_class_def(node);
         self.scopes.pop();
     }
 }
@@ -740,7 +783,8 @@ impl LanguageServer for Backend {
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
-                if let Some(binding) = Backend::resolve_binding_at_offset(text, suite, target_offset)
+                if let Some(binding) =
+                    Backend::resolve_binding_at_offset(text, suite, target_offset)
                 {
                     let definition_range = Range::new(
                         offset_to_lsp_position(text, binding.range.start as usize),
@@ -775,7 +819,8 @@ impl LanguageServer for Backend {
             if let (Some(target_offset), Some(suite)) =
                 (lsp_position_to_offset(text, position), maybe_ast)
             {
-                if let Some(binding) = Backend::resolve_binding_at_offset(text, suite, target_offset)
+                if let Some(binding) =
+                    Backend::resolve_binding_at_offset(text, suite, target_offset)
                 {
                     let mut references_visitor = ScopedReferencesVisitor {
                         text,
