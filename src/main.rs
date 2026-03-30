@@ -5,7 +5,7 @@ use std::time::Instant;
 use std::{env, fs};
 
 use dashmap::DashMap;
-use rustpython_ast::{Expr, ExprName, StmtClassDef, StmtFunctionDef, Suite, Visitor};
+use rustpython_ast::{Expr, ExprName, StmtAssign, StmtClassDef, StmtFunctionDef, Suite, Visitor};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
@@ -58,6 +58,22 @@ struct ParseErrorDetail<'a> {
     text: String, // file content
     line: u32,
     column: u32,
+}
+
+struct Binding {
+    name: String,
+    kind: SymbolKind,
+    range: StdRange<u32>,
+}
+
+struct Scope {
+    bindings: HashMap<String, Binding>,
+}
+
+// for module-level scope
+// for eg. scopes = [module/global, function]
+struct ScopeStack {
+    scopes: Vec<Scope>,
 }
 
 impl<'a> HoverVisitor<'a> {
@@ -363,6 +379,30 @@ impl<'a> Visitor for DocumentSymbolVisitor<'a> {
 
         self.generic_visit_stmt_class_def(node);
     }
+}
+
+impl Visitor for ScopeStack {
+    fn visit_stmt_assign(&mut self, node: StmtAssign) {
+        for target in &node.targets {
+            if let Expr::Name(name_expr) = target {
+                // last_mut: to get last element(last/current scope)
+                if let Some(current_scope) = self.scopes.last_mut() {
+                    current_scope.bindings.insert(
+                        name_expr.id.to_string(),
+                        Binding {
+                            name: name_expr.id.to_string(),
+                            kind: SymbolKind::VARIABLE,
+                            range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                        },
+                    );
+                }
+            }
+        }
+
+        self.generic_visit_stmt_assign(node);
+    }
+
+    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {}
 }
 
 impl Backend {

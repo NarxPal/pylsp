@@ -18,8 +18,12 @@ class Account:
         self.id = id
 
 
+def display_name():
+    print("hello")
+
 
 user = User("narendra")
 result = greet(user.display_name())
 print(result)
 print(user)
+display_name()
