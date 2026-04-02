@@ -5,7 +5,10 @@ use std::time::Instant;
 use std::{env, fs};
 
 use dashmap::DashMap;
-use rustpython_ast::{Expr, ExprName, StmtAssign, StmtClassDef, StmtFunctionDef, Suite, Visitor};
+use rustpython_ast::{
+    Expr, ExprName, Stmt, StmtAssign, StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom,
+    Suite, Visitor,
+};
 use rustpython_parser::{Parse, ast};
 use tokio::io::{stdin, stdout};
 use tower_lsp::jsonrpc::Result;
@@ -55,17 +58,25 @@ struct ParseErrorDetail<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct ImportBinding {
+    module: Option<String>,
+    name: Option<String>,
+    level: usize,
+}
+
+#[derive(Clone, Debug)]
 struct Binding {
     name: String,
     kind: SymbolKind,
     range: StdRange<u32>,
+    import: Option<ImportBinding>,
 }
 
 struct Scope {
     bindings: HashMap<String, Binding>,
 }
 
-// for module-level scope
+// for module-level scoping
 struct ScopeStack<'a> {
     text: &'a str,
     scopes: Vec<Scope>, // for eg. scopes = Vec[module/global, function]
@@ -78,31 +89,6 @@ struct ScopedReferencesVisitor<'a> {
     target: Binding,
     scopes: Vec<Scope>,
     locations: Vec<StdRange<u32>>,
-}
-
-impl<'a> HoverVisitor<'a> {
-    fn record_symbol(
-        &mut self,
-        outer_range: rustpython_parser::text_size::TextRange,
-        name: &str,
-        kind: SymbolKind,
-        detail: Option<String>,
-    ) {
-        if let Some(name_range) = symbol_name_range(self.text, outer_range, name) {
-            if self.target_offset >= name_range.start && self.target_offset < name_range.end {
-                self.found_name = Some(name.to_string());
-            }
-
-            self.symbol_table.insert(
-                name.to_string(),
-                SymbolInfo {
-                    name: name.to_string(),
-                    kind,
-                    detail,
-                },
-            );
-        }
-    }
 }
 
 // convert {line, char} to byte_number
@@ -210,6 +196,67 @@ fn symbol_name_range(
     Some(abs_start as u32..abs_end as u32)
 }
 
+fn import_binding(alias: &rustpython_ast::Alias, level: usize) -> (String, Binding) {
+    let module_name = alias.name.to_string();
+    let local_name = alias
+        .asname
+        .as_ref()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| {
+            module_name
+                .split('.')
+                .next()
+                .unwrap_or(module_name.as_str())
+                .to_string()
+        });
+
+    (
+        local_name.clone(),
+        Binding {
+            name: local_name,
+            kind: SymbolKind::MODULE,
+            range: alias.range.start().to_u32()..alias.range.end().to_u32(),
+            import: Some(ImportBinding {
+                module: Some(module_name),
+                name: None,
+                level,
+            }),
+        },
+    )
+}
+
+fn import_from_binding(
+    module: Option<&str>,
+    level: usize,
+    alias: &rustpython_ast::Alias,
+) -> Option<(String, Binding)> {
+    let imported_name = alias.name.to_string();
+
+    if imported_name == "*" {
+        return None;
+    }
+
+    let local_name = alias
+        .asname
+        .as_ref()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| imported_name.clone());
+
+    Some((
+        local_name.clone(),
+        Binding {
+            name: local_name,
+            kind: SymbolKind::VARIABLE,
+            range: alias.range.start().to_u32()..alias.range.end().to_u32(),
+            import: Some(ImportBinding {
+                module: module.map(str::to_string),
+                name: Some(imported_name),
+                level,
+            }),
+        },
+    ))
+}
+
 fn function_signature(node: &StmtFunctionDef) -> String {
     /*
         since there's no single "node.params" string which could get us the params, so we have to get params by building them using the argument nodes
@@ -272,6 +319,31 @@ fn create_diagnostic(range: Range, message: String) -> Diagnostic {
         tags: None,
         data: None,
         code_description: None, // link to specific doc for the specific error
+    }
+}
+
+impl<'a> HoverVisitor<'a> {
+    fn record_symbol(
+        &mut self,
+        outer_range: rustpython_parser::text_size::TextRange,
+        name: &str,
+        kind: SymbolKind,
+        detail: Option<String>,
+    ) {
+        if let Some(name_range) = symbol_name_range(self.text, outer_range, name) {
+            if self.target_offset >= name_range.start && self.target_offset < name_range.end {
+                self.found_name = Some(name.to_string());
+            }
+
+            self.symbol_table.insert(
+                name.to_string(),
+                SymbolInfo {
+                    name: name.to_string(),
+                    kind,
+                    detail,
+                },
+            );
+        }
     }
 }
 
@@ -414,12 +486,49 @@ impl<'a> Visitor for ScopeStack<'a> {
                         name: name_expr.id.to_string(),
                         kind: SymbolKind::VARIABLE,
                         range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                        import: None,
                     },
                 )
             }
         }
 
         self.generic_visit_stmt_assign(node);
+    }
+
+    fn visit_stmt_import(&mut self, node: StmtImport) {
+        for alias in &node.names {
+            let (local_name, binding) = import_binding(alias, 0);
+
+            if self.target_offset >= binding.range.start && self.target_offset < binding.range.end {
+                self.resolved_binding = Some(binding.clone());
+            }
+
+            self.bind_current(local_name, binding);
+        }
+    }
+
+    fn visit_stmt_import_from(&mut self, node: StmtImportFrom) {
+        let level = node
+            .level
+            .as_ref()
+            .map(|level| level.to_usize())
+            .unwrap_or(0);
+
+        for alias in &node.names {
+            let Some((local_name, binding)) = import_from_binding(
+                node.module.as_ref().map(|module| module.as_str()),
+                level,
+                alias,
+            ) else {
+                continue;
+            };
+
+            if self.target_offset >= binding.range.start && self.target_offset < binding.range.end {
+                self.resolved_binding = Some(binding.clone());
+            }
+
+            self.bind_current(local_name, binding);
+        }
     }
 
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
@@ -429,6 +538,7 @@ impl<'a> Visitor for ScopeStack<'a> {
                 name: node.name.to_string(),
                 kind: SymbolKind::FUNCTION,
                 range: name_range.clone(),
+                import: None,
             };
 
             if self.target_offset >= name_range.start && self.target_offset < name_range.end {
@@ -448,6 +558,7 @@ impl<'a> Visitor for ScopeStack<'a> {
                 name: arg.def.arg.to_string(),
                 kind: SymbolKind::VARIABLE, // Variable here refer to params
                 range: arg.def.range.start().to_u32()..arg.def.range.end().to_u32(), // arg.def refer to param node which contains name, param type, range
+                import: None,
             };
 
             if self.target_offset >= binding.range.start && self.target_offset < binding.range.end {
@@ -471,6 +582,7 @@ impl<'a> Visitor for ScopeStack<'a> {
                 name: node.name.to_string(),
                 kind: SymbolKind::CLASS,
                 range: name_range.clone(),
+                import: None,
             };
 
             if self.target_offset >= name_range.start && self.target_offset < name_range.end {
@@ -510,6 +622,7 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
                         name: name_expr.id.to_string(),
                         kind: SymbolKind::VARIABLE,
                         range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                        import: None,
                     },
                 );
             }
@@ -518,12 +631,49 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
         self.generic_visit_stmt_assign(node);
     }
 
+    fn visit_stmt_import(&mut self, node: StmtImport) {
+        for alias in &node.names {
+            let (local_name, binding) = import_binding(alias, 0);
+
+            if self.matches_target(&binding) {
+                self.locations.push(binding.range.clone());
+            }
+
+            self.bind_current(local_name, binding);
+        }
+    }
+
+    fn visit_stmt_import_from(&mut self, node: StmtImportFrom) {
+        let level = node
+            .level
+            .as_ref()
+            .map(|level| level.to_usize())
+            .unwrap_or(0);
+
+        for alias in &node.names {
+            let Some((local_name, binding)) = import_from_binding(
+                node.module.as_ref().map(|module| module.as_str()),
+                level,
+                alias,
+            ) else {
+                continue;
+            };
+
+            if self.matches_target(&binding) {
+                self.locations.push(binding.range.clone());
+            }
+
+            self.bind_current(local_name, binding);
+        }
+    }
+
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         if let Some(name_range) = symbol_name_range(self.text, node.range, node.name.as_str()) {
             let fn_binding = Binding {
                 name: node.name.to_string(),
                 kind: SymbolKind::FUNCTION,
                 range: name_range.clone(),
+                import: None,
             };
 
             if self.matches_target(&fn_binding) {
@@ -542,6 +692,7 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
                 name: arg.def.arg.to_string(),
                 kind: SymbolKind::VARIABLE,
                 range: arg.def.range.start().to_u32()..arg.def.range.end().to_u32(),
+                import: None,
             };
 
             if self.matches_target(&binding) {
@@ -561,6 +712,7 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
                 name: node.name.to_string(),
                 kind: SymbolKind::CLASS,
                 range: name_range.clone(),
+                import: None,
             };
 
             if self.matches_target(&class_binding) {
@@ -606,6 +758,7 @@ impl Backend {
         visitor
     }
 
+    // take cursor position(target_offset) and return definition for symbol based on scope
     fn resolve_binding_at_offset(text: &str, suite: &Suite, target_offset: u32) -> Option<Binding> {
         let mut visitor = ScopeStack {
             text,
@@ -617,6 +770,7 @@ impl Backend {
         };
 
         for stmt in suite {
+            // visit_stmt: calls methods inside ScopeStack visitor impl
             visitor.visit_stmt(stmt.clone());
             if visitor.resolved_binding.is_some() {
                 break;
@@ -624,6 +778,142 @@ impl Backend {
         }
 
         visitor.resolved_binding
+    }
+
+    fn resolve_import_location(&self, current_uri: &Url, binding: &Binding) -> Option<Location> {
+        let import = binding.import.as_ref()?;
+        let module_path =
+            self.resolve_module_path(current_uri, import.module.as_deref(), import.level)?;
+        let target_uri = Url::from_file_path(&module_path).ok()?;
+
+        if import.name.is_none() {
+            return Some(Location::new(
+                target_uri,
+                Range::new(Position::new(0, 0), Position::new(0, 0)),
+            ));
+        }
+
+        let symbol_name = import.name.as_ref()?;
+        let (text, suite) = self.load_parsed_file(&target_uri)?;
+
+        if let Some(range) = self.find_top_level_symbol_range(&text, &suite, symbol_name) {
+            let lsp_range = Range::new(
+                offset_to_lsp_position(&text, range.start as usize),
+                offset_to_lsp_position(&text, range.end as usize),
+            );
+            return Some(Location::new(target_uri, lsp_range));
+        }
+
+        Some(Location::new(
+            target_uri,
+            Range::new(Position::new(0, 0), Position::new(0, 0)),
+        ))
+    }
+
+    fn resolve_module_path(
+        &self,
+        current_uri: &Url,
+        module: Option<&str>,
+        level: usize,
+    ) -> Option<PathBuf> {
+        let current_path = current_uri.to_file_path().ok()?;
+        let current_dir = current_path.parent()?;
+
+        if level > 0 {
+            let mut base = current_dir.to_path_buf();
+            for _ in 1..level {
+                base = base.parent()?.to_path_buf();
+            }
+            return self.find_module_under_base(&base, module);
+        }
+
+        for base in current_dir.ancestors() {
+            if let Some(path) = self.find_module_under_base(base, module) {
+                return Some(path);
+            }
+        }
+
+        None
+    }
+
+    fn find_module_under_base(&self, base: &Path, module: Option<&str>) -> Option<PathBuf> {
+        match module {
+            Some(module_name) => {
+                let relative = module_name
+                    .split('.')
+                    .fold(PathBuf::new(), |mut path, part| {
+                        path.push(part);
+                        path
+                    });
+
+                let file_candidate = base.join(&relative).with_extension("py");
+                if file_candidate.is_file() {
+                    return Some(file_candidate);
+                }
+
+                let package_candidate = base.join(&relative).join("__init__.py");
+                if package_candidate.is_file() {
+                    return Some(package_candidate);
+                }
+
+                None
+            }
+            None => {
+                let package_candidate = base.join("__init__.py");
+                if package_candidate.is_file() {
+                    Some(package_candidate)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn load_parsed_file(&self, uri: &Url) -> Option<(String, Suite)> {
+        if let Some(entry) = self.files.get(uri) {
+            let (text, maybe_ast) = entry.value();
+            return maybe_ast
+                .as_ref()
+                .map(|suite| (text.clone(), suite.clone()));
+        }
+
+        let path = uri.to_file_path().ok()?;
+        let text = fs::read_to_string(path).ok()?;
+        let suite = ast::Suite::parse(&text, uri.as_str()).ok()?;
+        Some((text, suite))
+    }
+
+    fn find_top_level_symbol_range(
+        &self,
+        text: &str,
+        suite: &Suite,
+        name: &str,
+    ) -> Option<StdRange<u32>> {
+        for stmt in suite {
+            match stmt {
+                Stmt::FunctionDef(node) if node.name.as_str() == name => {
+                    return symbol_name_range(text, node.range, node.name.as_str());
+                }
+                Stmt::ClassDef(node) if node.name.as_str() == name => {
+                    return symbol_name_range(text, node.range, node.name.as_str());
+                }
+                Stmt::Assign(node) => {
+                    for target in &node.targets {
+                        if let Expr::Name(name_expr) = target {
+                            if name_expr.id.as_str() == name {
+                                return Some(
+                                    name_expr.range.start().to_u32()
+                                        ..name_expr.range.end().to_u32(),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     // custom helper method to avoid repetitiveness
@@ -786,6 +1076,12 @@ impl LanguageServer for Backend {
                 if let Some(binding) =
                     Backend::resolve_binding_at_offset(text, suite, target_offset)
                 {
+                    if binding.import.is_some() {
+                        if let Some(location) = self.resolve_import_location(&uri, &binding) {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                        }
+                    }
+
                     let definition_range = Range::new(
                         offset_to_lsp_position(text, binding.range.start as usize),
                         offset_to_lsp_position(text, binding.range.end as usize),

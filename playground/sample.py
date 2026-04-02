@@ -1,3 +1,14 @@
+import a
+from a import greet
+from a import User as Person
+from a import value
+
+a
+greet()
+Person
+value
+
+
 def greet(name: str) -> str:
     message = f"hellow, {name}"
     return message
@@ -38,4 +49,5 @@ user = User("narendra")
 result = greet(user.display_name())
 print(result)
 print(user)
+print(name)
 display_name()
