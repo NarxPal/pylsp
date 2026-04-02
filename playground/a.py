@@ -4,4 +4,5 @@ def greet():
 class User:
     pass
 
+
 value = 42

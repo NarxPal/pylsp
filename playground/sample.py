@@ -5,6 +5,7 @@ from a import value
 
 a
 greet()
+x = greet
 Person
 value
 

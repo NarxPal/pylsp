@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range as StdRange;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -85,8 +85,11 @@ struct ScopeStack<'a> {
 }
 
 struct ScopedReferencesVisitor<'a> {
+    backend: &'a Backend,
+    current_uri: Url,
     text: &'a str,
     target: Binding,
+    target_location: Location,
     scopes: Vec<Scope>,
     locations: Vec<StdRange<u32>>,
 }
@@ -461,7 +464,11 @@ impl<'a> ScopedReferencesVisitor<'a> {
     }
 
     fn matches_target(&self, binding: &Binding) -> bool {
-        binding.name == self.target.name && binding.range == self.target.range
+        self.backend
+            .binding_definition_location(&self.current_uri, binding)
+            .is_some_and(|location| {
+                location.uri == self.target_location.uri && location.range == self.target_location.range
+            })
     }
 }
 
@@ -778,6 +785,47 @@ impl Backend {
         }
 
         visitor.resolved_binding
+    }
+
+    fn binding_definition_location(&self, current_uri: &Url, binding: &Binding) -> Option<Location> {
+        if binding.import.is_some() {
+            return self.resolve_import_location(current_uri, binding);
+        }
+
+        let (text, _) = self.load_parsed_file(current_uri)?;
+        let range = Range::new(
+            offset_to_lsp_position(&text, binding.range.start as usize),
+            offset_to_lsp_position(&text, binding.range.end as usize),
+        );
+
+        Some(Location::new(current_uri.clone(), range))
+    }
+
+    fn workspace_python_uris(&self) -> Vec<Url> {
+        let mut uris = Vec::new();
+        let mut seen = HashSet::new();
+
+        for entry in &self.files {
+            let uri = entry.key().clone();
+            if seen.insert(uri.to_string()) {
+                uris.push(uri);
+            }
+        }
+
+        if let Ok(root) = env::current_dir() {
+            let mut paths = Vec::new();
+            collect_py_files(&root, &mut paths);
+
+            for path in paths {
+                if let Ok(uri) = Url::from_file_path(&path) {
+                    if seen.insert(uri.to_string()) {
+                        uris.push(uri);
+                    }
+                }
+            }
+        }
+
+        uris
     }
 
     fn resolve_import_location(&self, current_uri: &Url, binding: &Binding) -> Option<Location> {
@@ -1118,29 +1166,44 @@ impl LanguageServer for Backend {
                 if let Some(binding) =
                     Backend::resolve_binding_at_offset(text, suite, target_offset)
                 {
-                    let mut references_visitor = ScopedReferencesVisitor {
-                        text,
-                        target: binding,
-                        scopes: vec![Scope {
-                            bindings: HashMap::new(),
-                        }],
-                        locations: Vec::new(),
+                    let Some(target_location) = self.binding_definition_location(&uri, &binding)
+                    else {
+                        return Ok(None);
                     };
-
-                    for stmt in suite {
-                        references_visitor.visit_stmt(stmt.clone());
-                    }
 
                     let mut locations = Vec::new();
 
-                    for location in references_visitor.locations {
-                        let range = Range::new(
-                            offset_to_lsp_position(text, location.start as usize),
-                            offset_to_lsp_position(text, location.end as usize),
-                        );
+                    for file_uri in self.workspace_python_uris() {
+                        let Some((file_text, file_suite)) = self.load_parsed_file(&file_uri) else {
+                            continue;
+                        };
 
-                        locations.push(Location::new(uri.clone(), range));
+                        let mut references_visitor = ScopedReferencesVisitor {
+                            backend: self,
+                            current_uri: file_uri.clone(),
+                            text: &file_text,
+                            target: binding.clone(),
+                            target_location: target_location.clone(),
+                            scopes: vec![Scope {
+                                bindings: HashMap::new(),
+                            }],
+                            locations: Vec::new(),
+                        };
+
+                        for stmt in &file_suite {
+                            references_visitor.visit_stmt(stmt.clone());
+                        }
+
+                        for location in references_visitor.locations {
+                            let range = Range::new(
+                                offset_to_lsp_position(&file_text, location.start as usize),
+                                offset_to_lsp_position(&file_text, location.end as usize),
+                            );
+
+                            locations.push(Location::new(file_uri.clone(), range));
+                        }
                     }
+
                     return Ok(Some(locations));
                 }
             }
