@@ -200,7 +200,9 @@ fn symbol_name_range(
 }
 
 fn import_binding(alias: &rustpython_ast::Alias, level: usize) -> (String, Binding) {
+    //   eg. in (import pkg.mod as m), "pkg.mod" is .name
     let module_name = alias.name.to_string();
+    //   eg. in (import pkg.mod as m), "m" is asname
     let local_name = alias
         .asname
         .as_ref()
@@ -208,7 +210,7 @@ fn import_binding(alias: &rustpython_ast::Alias, level: usize) -> (String, Bindi
         .unwrap_or_else(|| {
             module_name
                 .split('.')
-                .next()
+                .next() // pop out the word before "."
                 .unwrap_or(module_name.as_str())
                 .to_string()
         });
@@ -434,8 +436,10 @@ impl<'a> Visitor for DocumentSymbolVisitor<'a> {
 
 impl<'a> ScopeStack<'a> {
     fn bind_current(&mut self, name: String, binding: Binding) {
+        /*
         // last_mut: will get the "new Scope object" from stmt_fn_def
         // last_mut: to get last element(last/current scope)
+         */
         if let Some(current_scope) = self.scopes.last_mut() {
             current_scope.bindings.insert(name, binding);
         }
@@ -446,6 +450,33 @@ impl<'a> ScopeStack<'a> {
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name).cloned())
+    }
+
+    fn bind_assignment_target(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(name_expr) => {
+                self.bind_current(
+                    name_expr.id.to_string(),
+                    Binding {
+                        name: name_expr.id.to_string(),
+                        kind: SymbolKind::VARIABLE,
+                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                        import: None,
+                    },
+                );
+            }
+            Expr::Tuple(tuple_expr) => {
+                for elt in &tuple_expr.elts {
+                    self.bind_assignment_target(elt);
+                }
+            }
+            Expr::List(list_expr) => {
+                for elt in &list_expr.elts {
+                    self.bind_assignment_target(elt);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -467,8 +498,36 @@ impl<'a> ScopedReferencesVisitor<'a> {
         self.backend
             .binding_definition_location(&self.current_uri, binding)
             .is_some_and(|location| {
-                location.uri == self.target_location.uri && location.range == self.target_location.range
+                location.uri == self.target_location.uri
+                    && location.range == self.target_location.range
             })
+    }
+
+    fn bind_assignment_target(&mut self, target: &Expr) {
+        match target {
+            Expr::Name(name_expr) => {
+                self.bind_current(
+                    name_expr.id.to_string(),
+                    Binding {
+                        name: name_expr.id.to_string(),
+                        kind: SymbolKind::VARIABLE,
+                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
+                        import: None,
+                    },
+                );
+            }
+            Expr::Tuple(tuple_expr) => {
+                for elt in &tuple_expr.elts {
+                    self.bind_assignment_target(elt);
+                }
+            }
+            Expr::List(list_expr) => {
+                for elt in &list_expr.elts {
+                    self.bind_assignment_target(elt);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -486,23 +545,14 @@ impl<'a> Visitor for ScopeStack<'a> {
 
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
         for target in &node.targets {
-            if let Expr::Name(name_expr) = target {
-                self.bind_current(
-                    name_expr.id.to_string(),
-                    Binding {
-                        name: name_expr.id.to_string(),
-                        kind: SymbolKind::VARIABLE,
-                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
-                        import: None,
-                    },
-                )
-            }
+            self.bind_assignment_target(target);
         }
 
         self.generic_visit_stmt_assign(node);
     }
 
     fn visit_stmt_import(&mut self, node: StmtImport) {
+        // node.names is a vec and contains each "import" line
         for alias in &node.names {
             let (local_name, binding) = import_binding(alias, 0);
 
@@ -622,17 +672,7 @@ impl<'a> Visitor for ScopedReferencesVisitor<'a> {
 
     fn visit_stmt_assign(&mut self, node: StmtAssign) {
         for target in &node.targets {
-            if let Expr::Name(name_expr) = target {
-                self.bind_current(
-                    name_expr.id.to_string(),
-                    Binding {
-                        name: name_expr.id.to_string(),
-                        kind: SymbolKind::VARIABLE,
-                        range: name_expr.range.start().to_u32()..name_expr.range.end().to_u32(),
-                        import: None,
-                    },
-                );
-            }
+            self.bind_assignment_target(target);
         }
 
         self.generic_visit_stmt_assign(node);
@@ -787,7 +827,11 @@ impl Backend {
         visitor.resolved_binding
     }
 
-    fn binding_definition_location(&self, current_uri: &Url, binding: &Binding) -> Option<Location> {
+    fn binding_definition_location(
+        &self,
+        current_uri: &Url,
+        binding: &Binding,
+    ) -> Option<Location> {
         if binding.import.is_some() {
             return self.resolve_import_location(current_uri, binding);
         }

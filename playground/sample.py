@@ -9,6 +9,18 @@ x = greet
 Person
 value
 
+f, b = (1, 2)
+print(f)
+print(b)
+
+s, (y, z) = (1, (2, 3))
+print(y)
+print(z)
+
+[p, q] = [1, 2]
+print(p)
+print(q)
+
 
 def greet(name: str) -> str:
     message = f"hellow, {name}"
